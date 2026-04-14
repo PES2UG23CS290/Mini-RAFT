@@ -1,50 +1,178 @@
-import type { LeaderTracker } from "./leader"
+import type { LeaderSource } from "./leader";
 import { StrokeSchema } from "./types";
-import type { WSEvents } from "hono/ws";
+import type { WSEvents, WSContext } from "hono/ws";
 
-export function setupWebSocket(tracker: LeaderTracker): WSEvents {
-    return {
-        onOpen(evt, ws) {
-            // @ts-ignore - Bun extends the standard WS Context with subscribe
-            ws.subscribe("strokes");
+type Logger = Pick<Console, "error" | "log">;
+type FetchImpl = typeof fetch;
 
-            const leaderUrl = tracker.getLeaderUrl();
-            if (!leaderUrl) return;
+type WebSocketOptions = {
+  fetchImpl?: FetchImpl;
+  logger?: Logger;
+};
 
-            fetch(leaderUrl + "/log").then(res => res.json()).then((data: any) => {
+/**
+ * ClientManager handles tracking all connected WebSocket clients
+ * and broadcasting messages to all of them (except the sender).
+ * 
+ * This is necessary because Hono's WebSocket adapter doesn't expose
+ * Bun's native pub/sub methods (subscribe/publish/unsubscribe).
+ */
+class ClientManager {
+  /** Set of all connected WebSocket clients */
+  private clients = new Set<WSContext>();
+  private logger: Logger;
 
-                ws.send(JSON.stringify({ type: 'history', strokes: data.entries }));
-            }).catch(err => console.error("Failed to fetch history", err));
-        },
+  constructor(logger: Logger = console) {
+    this.logger = logger;
+  }
 
-        async onMessage(evt, ws) {
-            try {
-                // evt.data is usually a string or Buffer. We cast to string for JSON parsing.
-                const payload = JSON.parse(evt.data as string);
-                if (payload.type !== "stroke") return;
+  /** Add a new client when they connect */
+  add(ws: WSContext) {
+    this.clients.add(ws);
+    this.logger.log(`[ClientManager] Client connected. Total: ${this.clients.size}`);
+  }
 
-                // Zod validation prevents bad data from ever hitting the Go backend
-                const validStroke = StrokeSchema.parse(payload.stroke);
-                const leaderUrl = tracker.getLeaderUrl();
-                if (!leaderUrl) return;
-                fetch(leaderUrl + "/stroke", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(validStroke),
-                }).then(res => res.json()).then((data: any) => {
-                    if (data.committed) {
-                        // Publish beams the validated stroke to every connected browser in the 'strokes' room
-                        // @ts-ignore - Bun extends the standard WS Context with publish
-                        ws.publish("strokes", JSON.stringify({ type: 'stroke', stroke: validStroke }));
-                    }
-                }).catch(err => console.error("Failed to append stroke", err));
-            } catch (error) {
-                console.error("Failed to parse stroke", error);
-            }
-        },
-        onClose(evt, ws) {
-            // @ts-ignore
-            ws.unsubscribe("strokes");
-        }
+  /** Remove a client when they disconnect */
+  remove(ws: WSContext) {
+    this.clients.delete(ws);
+    this.logger.log(`[ClientManager] Client disconnected. Total: ${this.clients.size}`);
+  }
+
+  /**
+   * Broadcast a message to all clients EXCEPT the sender.
+   * This is the key function for real-time sync - when one user draws,
+   * all other users see the stroke immediately.
+   * 
+   * @param message - JSON string to send
+   * @param sender - The client who sent the original stroke (excluded from broadcast)
+   */
+  broadcast(message: string, sender?: WSContext) {
+    let sentCount = 0;
+    for (const client of this.clients) {
+      // Skip the sender - they already drew the stroke locally
+      if (client === sender) continue;
+      
+      try {
+        client.send(message);
+        sentCount++;
+      } catch (error) {
+        // Client might have disconnected, remove them
+        this.logger.error("[ClientManager] Failed to send to client, removing", error);
+        this.clients.delete(client);
+      }
     }
+    this.logger.log(`[ClientManager] Broadcast to ${sentCount} clients`);
+  }
+
+  /** Get the number of connected clients */
+  get size() {
+    return this.clients.size;
+  }
 }
+
+// Global client manager instance (shared across all WebSocket connections)
+const clientManager = new ClientManager();
+
+/**
+ * setupWebSocket wires the Bun/Hono WebSocket events to the Go RAFT backend APIs.
+ * It handles loading initial history, validating incoming strokes, forwarding them to 
+ * the Leader replica, and broadcasting committed strokes back to browsers.
+ */
+export function setupWebSocket(
+  tracker: LeaderSource,
+  { fetchImpl = fetch, logger = console }: WebSocketOptions = {},
+): WSEvents {
+  return {
+    /**
+     * onOpen: Triggered when a new user connects via WebSocket.
+     * We grab the full canvas history from the Go Leader's `GET /log` endpoint
+     * and push it down the socket so they can see existing drawings.
+     */
+    onOpen(_event, ws) {
+      // Track this client for broadcasting
+      clientManager.add(ws);
+
+      const leaderUrl = tracker.getLeaderUrl();
+      if (!leaderUrl) {
+        logger.error("[WebSocket] No leader available to fetch history");
+        return;
+      }
+
+      // Fetch and send stroke history to the new client
+      void fetchImpl(`${leaderUrl}/log`)
+        .then((response) => response.json())
+        .then((data: unknown) => {
+          const typedData = data as { entries?: unknown[] };
+          const historyMessage = JSON.stringify({ 
+            type: "history", 
+            strokes: typedData.entries ?? [] 
+          });
+          ws.send(historyMessage);
+          logger.log(`[WebSocket] Sent ${typedData.entries?.length ?? 0} history entries`);
+        })
+        .catch((error) => logger.error("[WebSocket] Failed to fetch history", error));
+    },
+
+    /**
+     * onMessage: Triggered when a user draws a stroke and sends JSON.
+     * We validate it with Zod, forward it to the Go Leader's `POST /stroke` API,
+     * and wait safely for RAFT confirmation before broadcasting.
+     */
+    async onMessage(event, ws) {
+      try {
+        const payload = JSON.parse(String(event.data));
+
+        if (payload.type !== "stroke") {
+          return;
+        }
+
+        // Validate stroke data with Zod schema
+        const validStroke = StrokeSchema.parse(payload.stroke);
+        const leaderUrl = tracker.getLeaderUrl();
+
+        if (!leaderUrl) {
+          logger.error("[WebSocket] No leader available to accept stroke");
+          return;
+        }
+
+        // Forward the stroke to the RAFT Leader
+        // The Leader will replicate it to Followers via AppendEntries
+        const response = await fetchImpl(`${leaderUrl}/stroke`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(validStroke),
+        });
+
+        const data = await response.json() as { committed?: boolean };
+
+        // Only broadcast after RAFT commits (majority ACK)
+        // This ensures all clients see consistent, committed data
+        if (data.committed) {
+          const broadcastMessage = JSON.stringify({ 
+            type: "stroke", 
+            stroke: validStroke 
+          });
+          
+          // Send to all clients EXCEPT the sender
+          // The sender already drew the stroke locally (optimistic UI)
+          clientManager.broadcast(broadcastMessage, ws);
+        } else {
+          logger.error("[WebSocket] Stroke not committed by RAFT");
+        }
+      } catch (error) {
+        logger.error("[WebSocket] Failed to process stroke", error);
+      }
+    },
+
+    /**
+     * onClose: Triggered when a browser tab closes.
+     * Remove the client from our tracking set.
+     */
+    onClose(_event, ws) {
+      clientManager.remove(ws);
+    },
+  };
+}
+
+// Export for testing
+export { ClientManager, clientManager };
