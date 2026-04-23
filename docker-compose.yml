@@ -42,7 +42,7 @@ services:
       - ./gateway/leader.ts:/app/leader.ts
       - ./gateway/types.ts:/app/types.ts
     environment:
-      - REPLICA_URLS=http://replica1:9001,http://replica2:9002,http://replica3:9003
+      - REPLICA_URLS=http://replica1:9001,http://replica2:9002,http://replica3:9003 #,http://replica4:9004
       - GATEWAY_PORT=8080
     depends_on:
       replica1:
@@ -51,6 +51,8 @@ services:
         condition: service_healthy
       replica3:
         condition: service_healthy
+      # replica4:
+      #   condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/status"]
       interval: 5s
@@ -71,7 +73,7 @@ services:
     environment:
       - REPLICA_ID=replica1
       - PORT=9001
-      - PEERS=http://replica2:9002,http://replica3:9003
+      - PEERS=http://replica2:9002,http://replica3:9003 #,http://replica4:9004
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9001/health"]
       interval: 5s
@@ -92,7 +94,7 @@ services:
     environment:
       - REPLICA_ID=replica2
       - PORT=9002
-      - PEERS=http://replica1:9001,http://replica3:9003
+      - PEERS=http://replica1:9001,http://replica3:9003 #,http://replica4:9004
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9002/health"]
       interval: 5s
@@ -113,13 +115,34 @@ services:
     environment:
       - REPLICA_ID=replica3
       - PORT=9003
-      - PEERS=http://replica1:9001,http://replica2:9002
+      - PEERS=http://replica1:9001,http://replica2:9002 #,http://replica4:9004
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9003/health"]
       interval: 5s
       timeout: 3s
       retries: 10
       start_period: 10s
+
+  # replica4:
+  #   container_name: node4
+  #   build:
+  #     context: ./replica4
+  #     dockerfile: Dockerfile
+  #   working_dir: /app
+  #   ports:
+  #     - "9004:9004"
+  #   volumes:
+  #     - ./replica4:/app
+  #   environment:
+  #     - REPLICA_ID=replica4
+  #     - PORT=9004
+  #     - PEERS=http://replica1:9001,http://replica2:9002,http://replica3:9003
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-fsS", "http://localhost:9004/health"]
+  #     interval: 5s
+  #     timeout: 3s
+  #     retries: 10
+  #     start_period: 10s
 
 networks:
   default:
